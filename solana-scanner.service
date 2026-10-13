@@ -1,5 +1,5 @@
 [Unit]
-Description=Solana Dormant Token Scanner & Wallet Watcher
+Description=Solana Dormant Token Revival Radar
 After=network.target
 
 [Service]
@@ -7,7 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/solana-dormant-pump-scanner
 EnvironmentFile=/root/solana-dormant-pump-scanner/.env
-ExecStart=/usr/bin/python3 -u dormant_pump_scanner.py watch --interval 20
+ExecStart=/usr/bin/python3 -u dormant_pump_scanner.py radar --interval 12
 Restart=always
 RestartSec=10
 

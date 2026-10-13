@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
 dormant_pump_scanner.py
-Detects "dead coin wakes up -> pump -> dump" setups on Solana and profiles the wallets behind them.
+Detects "dead coin wakes up -> pump -> dump" setups on Solana.
 
-  scan      screen old pools that are suddenly ripping, confirm dormancy, profile wallets
-  analyze   run the full check on one pool address (good for backtesting known examples)
-  wallets   leaderboard of wallets that repeat the playbook across different tokens
-  watch     poll the wallets on that leaderboard and alert when one buys a dormant coin
+Modes:
+  radar     [RECOMMENDED] Zero-cost DexScreener & DexPaprika stream.
+            Catches old tokens (>6mo) that are newly active or boosted.
+            Immune to burner wallets, zero Helius credit drain.
+  scan      Screen old pools ripping on DexPaprika and profile early buyers.
+  analyze   Deep dive into one pool address (candles + buyer profiling).
+  wallets   Leaderboard of wallets that repeat the playbook across tokens.
+  watch     Poll Helius for transactions from leaderboard wallets.
 
-Env:  HELIUS_API_KEY (required for wallet profiling / watch)
-      TELEGRAM_BOT_TOKEN (optional; for Telegram alerts)
-      TELEGRAM_CHAT_ID   (optional; target chat/channel for Telegram alerts)
-      DISCORD_WEBHOOK    (optional; alert target for Discord)
-      DEXPAPRIKA_API_KEY (optional; switches to api-pro host)
-Deps: pip install -r requirements.txt
+Env:
+  TELEGRAM_BOT_TOKEN  (optional; instant HTML Telegram alerts)
+  TELEGRAM_CHAT_ID    (optional; target chat/group for Telegram)
+  DISCORD_WEBHOOK     (optional; secondary Discord alerts)
+  HELIUS_API_KEY      (optional for radar; required for wallet profiling / watch)
+  DEXPAPRIKA_API_KEY  (optional; switches to api-pro host)
 """
 import argparse, html, json, os, sqlite3, statistics, time
 from collections import defaultdict
@@ -81,8 +85,15 @@ def fmt(t):
     return datetime.fromtimestamp(t, timezone.utc).strftime("%m-%d %H:%M")
 
 
-# ----------------------------------------------------------------- dexpaprika
+# ----------------------------------------------------------------- dexpaprika & dexscreener
 def sol_price():
+    try:
+        r = S.get(f"https://api.dexscreener.com/latest/dex/tokens/{WSOL}", timeout=10).json()
+        pairs = r.get("pairs") or []
+        if pairs:
+            return float(pairs[0].get("priceUsd") or 150.0)
+    except Exception:
+        pass
     try:
         return float(paprika(f"/networks/{NET}/tokens/{WSOL}")["summary"]["price_usd"])
     except Exception:
@@ -185,7 +196,7 @@ def evaluate_pool(pool, a):
     now = int(time.time())
     try:
         daily = get_ohlcv(pool, f"-{a.lookback}d", "24h", a.lookback + 1)
-    except Forbidden:  # free plans cap history at 30d
+    except Forbidden:
         daily = get_ohlcv(pool, "-30d", "24h", 31)
         a.lookback = 30
     hourly = get_ohlcv(pool, f"-{a.hours}h", "1h", a.hours + 1)
@@ -193,13 +204,18 @@ def evaluate_pool(pool, a):
 
 
 # ----------------------------------------------------------------- helius
-def helius_swaps(addr, since_ts, max_pages, limit=100):
+def helius_swaps(addr, since_ts, max_pages=10, limit=100):
+    if not HELIUS_KEY:
+        return []
     out, before = [], None
     for _ in range(max_pages):
         p = {"api-key": HELIUS_KEY, "type": "SWAP", "limit": limit}
         if before:
             p["before"] = before
-        batch = http_get(f"{HELIUS}/addresses/{addr}/transactions", p)
+        try:
+            batch = http_get(f"{HELIUS}/addresses/{addr}/transactions", p)
+        except Exception:
+            break
         if not batch:
             break
         out.extend(batch)
@@ -210,7 +226,6 @@ def helius_swaps(addr, since_ts, max_pages, limit=100):
 
 
 def parse_swap(tx, mint):
-    """Net flows for the fee payer: (payer, token_delta, sol_delta, stable_delta)."""
     payer = tx.get("feePayer")
     tok = wsol = stable = 0.0
     for t in tx.get("tokenTransfers") or []:
@@ -296,16 +311,63 @@ def send_discord(text):
         pass
 
 
+def notify_radar_alert(pair_data, trigger="Radar", early_buyers=None):
+    sym = pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
+    name = pair_data.get("baseToken", {}).get("name", "")
+    mint = pair_data.get("baseToken", {}).get("address", "")
+    pool = pair_data.get("pairAddress", "")
+    age_days = pair_data.get("_age_days", 0)
+    mcap = float(pair_data.get("fdv") or pair_data.get("marketCap") or 0)
+    liq = float(pair_data.get("liquidity", {}).get("usd") or 0)
+    vol_h1 = float(pair_data.get("volume", {}).get("h1") or 0)
+    vol_m5 = float(pair_data.get("volume", {}).get("m5") or 0)
+    change_h1 = float(pair_data.get("priceChange", {}).get("h1") or 0)
+
+    buyers_text = ""
+    if early_buyers:
+        buyers_text = "\n<b>Early Big Buyers:</b>\n"
+        for b in early_buyers[:3]:
+            w_short = f"{b['wallet'][:4]}...{b['wallet'][-4:]}"
+            buyers_text += (
+                f"• <a href='https://solscan.io/account/{b['wallet']}'>{w_short}</a>: "
+                f"in ${b['buy']:,.0f} | pnl ${b['pnl']:+,.0f}\n"
+            )
+
+    tg_text = (
+        f"🚨 <b>DORMANT COIN WAKES UP ({trigger})</b>\n\n"
+        f"<b>Token:</b> ${html.escape(sym)} ({html.escape(name)})\n"
+        f"<b>Age:</b> <b>{age_days:.0f} days old</b> (Created ~{age_days/30:.1f}mo ago)\n"
+        f"<b>Market Cap:</b> ${mcap:,.0f}\n"
+        f"<b>Liquidity:</b> ${liq:,.0f}\n"
+        f"<b>Volume:</b> 1h: ${vol_h1:,.0f} | 5m: ${vol_m5:,.0f}\n"
+        f"<b>1h Change:</b> {change_h1:+.1f}%\n"
+        f"{buyers_text}\n"
+        f"<b>Mint:</b> <code>{mint}</code>\n\n"
+        f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> | "
+        f"<a href='https://photon-sol.tinyastro.io/en/lp/{pool}'>Photon</a> | "
+        f"<a href='https://bullx.io/terminal?chainId=1399811149&address={mint}'>BullX</a> | "
+        f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
+    )
+
+    plain = (
+        f"[{trigger}] ${sym} is waking up! Age: {age_days:.0f}d, Mcap: ${mcap:,.0f}, "
+        f"1h Vol: ${vol_h1:,.0f}, Pool: {pool}"
+    )
+    print("\n" + "="*60 + "\n*** RADAR ALERT *** " + plain + "\n" + "="*60)
+    send_telegram(tg_text)
+    send_discord(plain)
+
+
 def notify_watch_alert(wallet, mint, pool, info, buy_usd=None):
     plain = (
         f"{wallet} bought {mint} (pool {pool}), dormant coin: only {info['active_frac']:.0%} of prior days "
         f"had trades; now {info['mult']:.1f}x baseline"
     )
-    print("\n*** ALERT ***", plain)
+    print("\n*** WATCH ALERT ***", plain)
 
     buy_str = f"<b>Buy:</b> ~${buy_usd:,.0f}\n" if buy_usd else ""
     tg_text = (
-        f"🚨 <b>Dormant Coin Wake-Up Alert</b>\n\n"
+        f"🚨 <b>Tracked Wallet Bought Dormant Coin</b>\n\n"
         f"<b>Wallet:</b> <code>{wallet}</code> (<a href='https://solscan.io/account/{wallet}'>Solscan</a>)\n"
         f"<b>Token:</b> <code>{mint}</code>\n"
         f"<b>Pool:</b> <code>{pool}</code>\n"
@@ -329,7 +391,9 @@ def db():
     CREATE TABLE IF NOT EXISTS events(pool TEXT, token TEXT, symbol TEXT, seen INT, baseline REAL,
         peak REAL, mult REAL, retrace REAL, status TEXT, PRIMARY KEY(pool, seen));
     CREATE TABLE IF NOT EXISTS wallet_events(wallet TEXT, pool TEXT, token TEXT, first INT, buy REAL,
-        sell REAL, pnl REAL, exit_frac REAL, early INT, PRIMARY KEY(wallet, pool));"""
+        sell REAL, pnl REAL, exit_frac REAL, early INT, PRIMARY KEY(wallet, pool));
+    CREATE TABLE IF NOT EXISTS radar_events(token TEXT PRIMARY KEY, pool TEXT, symbol TEXT, seen INT,
+        age_days REAL, mcap REAL, trigger TEXT);"""
     )
     return c
 
@@ -343,12 +407,12 @@ def process_pool(con, pool, mint, sym, ev, a, sol_usd):
         f"\n[{ev['status']}] {sym or mint}  pool={pool}\n   dormant: only {ev['active_frac']:.0%} of prior days had trades"
         f" | peak {ev['mult']:.1f}x baseline at {fmt(ev['peak_t'])} | now {ev['retrace']:.0%} of peak"
     )
-    if not HELIUS_KEY or a.no_wallets:
+    if not HELIUS_KEY or getattr(a, "no_wallets", False):
         return
     txs = helius_swaps(pool, ev["start"] - 3600, a.max_pages)
     rows = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, a.early_mins)
     print(f"   {len(txs)} swaps fetched, {len(rows)} wallets bought >= ${a.min_wallet_usd:,.0f} as their first action")
-    for r in rows[:a.top]:
+    for r in rows[: getattr(a, "top", 15)]:
         tag = "EARLY" if r["early"] else "     "
         print(
             f"   {tag} {r['wallet']}  in ${r['buy']:>8,.0f}  out ${r['sell']:>8,.0f}  pnl ${r['pnl']:>+8,.0f}"
@@ -360,6 +424,159 @@ def process_pool(con, pool, mint, sym, ev, a, sol_usd):
             (r["wallet"], pool, mint, r["first"], r["buy"], r["sell"], r["pnl"], r["exit_frac"], r["early"]),
         )
     con.commit()
+
+
+# ----------------------------------------------------------------- radar (dexscreener token-first)
+def fetch_dexscreener_pairs(token_addresses):
+    """Batch fetch up to 30 token addresses in a single request."""
+    if not token_addresses:
+        return []
+    url = "https://api.dexscreener.com/latest/dex/tokens/" + ",".join(token_addresses[:30])
+    try:
+        r = S.get(url, timeout=10).json()
+        return r.get("pairs") or []
+    except Exception as e:
+        print(f"DexScreener fetch error: {e}")
+        return []
+
+
+def check_candidate_pair(p, a, trigger):
+    if p.get("chainId") != "solana":
+        return None
+    created = p.get("pairCreatedAt")
+    if not created:
+        return None
+
+    now_ms = time.time() * 1000
+    age_days = (now_ms - created) / (86400 * 1000)
+    if age_days < a.min_age:
+        return None
+
+    mcap = float(p.get("fdv") or p.get("marketCap") or 0)
+    if mcap > a.max_mcap:
+        return None
+
+    liq = float(p.get("liquidity", {}).get("usd") or 0)
+    if a.max_liquidity and liq > a.max_liquidity:
+        return None
+
+    vol_h1 = float(p.get("volume", {}).get("h1") or 0)
+    vol_m5 = float(p.get("volume", {}).get("m5") or 0)
+
+    # In radar mode, require either a boost, recent 5m/1h volume, or transaction activity
+    if trigger == "Volume Spike" and vol_h1 < a.min_vol_h1 and vol_m5 < a.min_vol_m5:
+        return None
+
+    p["_age_days"] = age_days
+    return p
+
+
+def cmd_radar(a):
+    """
+    Real-time token radar. Streams DexScreener paid boosts, profile updates,
+    and DexPaprika spikes for tokens older than min_age (default 180 days).
+    Requires ZERO Helius credits to discover tokens.
+    """
+    con = db()
+    sol_usd = sol_price()
+    print(f"{datetime.now():%H:%M:%S} [RADAR] Starting token scanner:")
+    print(f"   Age >= {a.min_age} days | Mcap <= ${a.max_mcap:,.0f} | Max Liq <= ${a.max_liquidity:,.0f}")
+    print(f"   Alerts will go to Telegram: {'Enabled' if TELEGRAM_TOKEN else 'Disabled (Set TELEGRAM_BOT_TOKEN)'}")
+
+    # Load previously seen tokens from the last 12 hours
+    seen_tokens = set(
+        r[0]
+        for r in con.execute(
+            "SELECT token FROM radar_events WHERE seen > ?", (int(time.time()) - 12 * 3600,)
+        ).fetchall()
+    )
+
+    last_paprika_scan = 0
+
+    while True:
+        try:
+            # 1. Check DexScreener Token Boosts (real-time revivals)
+            boost_tokens = []
+            try:
+                r = S.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=8).json()
+                boost_tokens = [x["tokenAddress"] for x in r if x.get("chainId") == "solana"]
+            except Exception as e:
+                print(f"[Radar] Boost stream error: {e}")
+
+            # 2. Check DexScreener Token Profile Updates (CTO / Logo revivals)
+            profile_tokens = []
+            try:
+                r = S.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8).json()
+                profile_tokens = [x["tokenAddress"] for x in r if x.get("chainId") == "solana"]
+            except Exception as e:
+                print(f"[Radar] Profile stream error: {e}")
+
+            candidate_mints = [
+                m for m in set(boost_tokens + profile_tokens) if m not in seen_tokens and m not in BASE_MINTS
+            ]
+
+            if candidate_mints:
+                # Query DexScreener in chunks of 30
+                for i in range(0, len(candidate_mints), 30):
+                    batch = candidate_mints[i : i + 30]
+                    pairs = fetch_dexscreener_pairs(batch)
+                    for p in pairs:
+                        trigger = "DexScreener Boost" if p.get("baseToken", {}).get("address") in boost_tokens else "Profile Update"
+                        matched = check_candidate_pair(p, a, trigger)
+                        if matched:
+                            mint = matched["baseToken"]["address"]
+                            pool = matched["pairAddress"]
+                            sym = matched["baseToken"].get("symbol", "")
+                            seen_tokens.add(mint)
+                            con.execute(
+                                "INSERT OR REPLACE INTO radar_events VALUES(?,?,?,?,?,?,?)",
+                                (mint, pool, sym, int(time.time()), matched["_age_days"], float(matched.get("fdv") or 0), trigger),
+                            )
+                            con.commit()
+
+                            early_buyers = None
+                            if HELIUS_KEY and not a.no_helius:
+                                txs = helius_swaps(pool, int(time.time()) - 3600, max_pages=5)
+                                early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
+
+                            notify_radar_alert(matched, trigger=trigger, early_buyers=early_buyers)
+
+            # 3. Every 60 seconds, check DexPaprika for old pools with sudden volume spikes (even without boosts)
+            if time.time() - last_paprika_scan > 60:
+                last_paprika_scan = time.time()
+                try:
+                    cands = find_candidates(a)
+                    if cands:
+                        p_mints = [split_tokens(row)[0] for row in cands if split_tokens(row)[0]]
+                        p_mints = [m for m in p_mints if m not in seen_tokens]
+                        if p_mints:
+                            pairs = fetch_dexscreener_pairs(p_mints[:30])
+                            for p in pairs:
+                                matched = check_candidate_pair(p, a, "Volume Spike")
+                                if matched:
+                                    mint = matched["baseToken"]["address"]
+                                    pool = matched["pairAddress"]
+                                    sym = matched["baseToken"].get("symbol", "")
+                                    seen_tokens.add(mint)
+                                    con.execute(
+                                        "INSERT OR REPLACE INTO radar_events VALUES(?,?,?,?,?,?,?)",
+                                        (mint, pool, sym, int(time.time()), matched["_age_days"], float(matched.get("fdv") or 0), "Volume Spike"),
+                                    )
+                                    con.commit()
+
+                                    early_buyers = None
+                                    if HELIUS_KEY and not a.no_helius:
+                                        txs = helius_swaps(pool, int(time.time()) - 3600, max_pages=5)
+                                        early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
+
+                                    notify_radar_alert(matched, trigger="Volume Spike", early_buyers=early_buyers)
+                except Exception as e:
+                    print(f"[Radar] Paprika volume sweep error: {e}")
+
+        except Exception as e:
+            print(f"[Radar] Unexpected loop error: {e}")
+
+        time.sleep(a.interval)
 
 
 # ----------------------------------------------------------------- commands
@@ -430,7 +647,6 @@ def cmd_watch(a):
                 print("helius error", e)
                 continue
 
-            # Poll fix: Stop at previously seen signature to prevent re-processing old txs
             if w in last:
                 new = []
                 for t in txs:
@@ -493,24 +709,48 @@ def main():
         sp.add_argument("--top", type=int, default=15)
         sp.add_argument("--no-wallets", action="store_true")
 
+    # 1. RADAR: DexScreener token-first real-time stream (RECOMMENDED)
+    r = sub.add_parser("radar", help="Real-time DexScreener stream for old tokens waking up (zero Helius credits)")
+    r.add_argument("--min-age", type=int, default=180, help="minimum pool age in days (default: 180 = 6 months)")
+    r.add_argument("--max-mcap", type=float, default=75000, help="maximum market cap USD (default: 75,000)")
+    r.add_argument("--max-liquidity", type=float, default=25000, help="maximum liquidity USD (default: 25,000)")
+    r.add_argument("--min-vol-h1", type=float, default=1000, help="min 1h volume for volume trigger (default: 1,000)")
+    r.add_argument("--min-vol-m5", type=float, default=300, help="min 5m volume for volume trigger (default: 300)")
+    r.add_argument("--min-wallet-usd", type=float, default=500.0, help="minimum USD buy to profile early buyers")
+    r.add_argument("--min-change", type=float, default=50, help="1h price change percent for background sweep")
+    r.add_argument("--min-txns", type=int, default=15)
+    r.add_argument("--min-vol", type=float, default=1500)
+    r.add_argument("--pages", type=int, default=2)
+    r.add_argument("--interval", type=int, default=12, help="polling interval in seconds (default: 12)")
+    r.add_argument("--no-helius", action="store_true", help="skip Helius buyer profiling to preserve completely free operation")
+    r.set_defaults(f=cmd_radar)
+
+    # 2. SCAN: DexPaprika candidate screener
     s = sub.add_parser("scan"); common(s)
     s.add_argument("--min-age", type=int, default=30, help="pool age in days (default: 30)")
-    s.add_argument("--min-change", type=float, default=100, help="1h/6h price change %% to even consider")
+    s.add_argument("--min-change", type=float, default=100, help="1h/6h price change percent to consider")
     s.add_argument("--min-txns", type=int, default=20)
     s.add_argument("--min-vol", type=float, default=2000)
     s.add_argument("--pages", type=int, default=3)
     s.add_argument("--loop", type=int, default=0, help="repeat every N seconds")
     s.set_defaults(f=cmd_scan)
+
+    # 3. ANALYZE
     s = sub.add_parser("analyze"); common(s); s.add_argument("pool"); s.set_defaults(f=cmd_analyze)
+
+    # 4. WALLETS
     s = sub.add_parser("wallets"); s.add_argument("--min-tokens", type=int, default=2); s.set_defaults(f=cmd_wallets)
+
+    # 5. WATCH: Helius wallet poller
     s = sub.add_parser("watch"); common(s)
     s.add_argument("--min-tokens", type=int, default=2)
     s.add_argument("--wallets", help="file with extra wallet addresses, one per line")
     s.add_argument("--interval", type=int, default=20)
     s.set_defaults(f=cmd_watch)
+
     a = p.parse_args()
     if a.cmd in ("watch",) and not HELIUS_KEY:
-        p.error("HELIUS_API_KEY is required")
+        p.error("HELIUS_API_KEY is required for watch")
     a.f(a)
 
 
