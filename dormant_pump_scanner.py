@@ -114,27 +114,36 @@ def pool_info(pool):
 
 
 def find_candidates(a):
-    """Old pools whose price is ripping right now (server-side filter)."""
+    """
+    Finds dormant pools waking up RIGHT NOW.
+    Prioritizes 5-minute price surges with low transaction thresholds to catch the first buy.
+    """
     found = {}
-    for field in ("price_change_percentage_1h_min", "price_change_percentage_6h_min"):
+    # Scan 5m first (earliest possible signal), then 1h
+    fields = ("price_change_percentage_5m_min", "price_change_percentage_1h_min")
+    for field in fields:
         cursor = None
+        min_change = a.min_change_5m if "5m" in field else a.min_change
         for _ in range(a.pages):
             p = {
                 "created_before": f"-{a.min_age}d",
                 "txns_24h_min": a.min_txns,
                 "volume_usd_24h_min": a.min_vol,
-                field: a.min_change,
+                field: min_change,
                 "order_by": field.replace("_min", ""),
                 "sort": "desc",
                 "limit": 50,
             }
             if cursor:
                 p["cursor"] = cursor
-            d = paprika(f"/networks/{NET}/pools/search", **p)
-            for row in d.get("results", []):
-                found[row["id"]] = row
-            cursor = d.get("next_cursor")
-            if not d.get("has_next_page"):
+            try:
+                d = paprika(f"/networks/{NET}/pools/search", **p)
+                for row in d.get("results", []):
+                    found[row["id"]] = row
+                cursor = d.get("next_cursor")
+                if not d.get("has_next_page"):
+                    break
+            except Exception:
                 break
     return list(found.values())
 
@@ -321,7 +330,17 @@ def notify_radar_alert(pair_data, trigger="Radar", early_buyers=None):
     liq = float(pair_data.get("liquidity", {}).get("usd") or 0)
     vol_h1 = float(pair_data.get("volume", {}).get("h1") or 0)
     vol_m5 = float(pair_data.get("volume", {}).get("m5") or 0)
+    change_5m = float(pair_data.get("priceChange", {}).get("m5") or 0)
     change_h1 = float(pair_data.get("priceChange", {}).get("h1") or 0)
+    txns_5m = pair_data.get("txns", {}).get("m5", {}).get("buys", 0) + pair_data.get("txns", {}).get("m5", {}).get("sells", 0)
+
+    # Determine alert urgency and stage
+    if "5m" in trigger or "Early" in trigger or txns_5m <= 5:
+        stage_header = "🟢 <b>STAGE 1: FIRST WAKE-UP (MINUTE 0-5)</b>\n<i>Team is beginning initial entry on dead pool!</i>"
+    elif "Boost" in trigger:
+        stage_header = "⚠️ <b>STAGE 3: LATE / BOOST PAID (DUMP RISK)</b>\n<i>Team paid for DexScreener boost; possible exit liquidity!</i>"
+    else:
+        stage_header = f"🚨 <b>DORMANT COIN WAKES UP ({trigger})</b>"
 
     buyers_text = ""
     if early_buyers:
@@ -334,13 +353,13 @@ def notify_radar_alert(pair_data, trigger="Radar", early_buyers=None):
             )
 
     tg_text = (
-        f"🚨 <b>DORMANT COIN WAKES UP ({trigger})</b>\n\n"
+        f"{stage_header}\n\n"
         f"<b>Token:</b> ${html.escape(sym)} ({html.escape(name)})\n"
-        f"<b>Age:</b> <b>{age_days:.0f} days old</b> (Created ~{age_days/30:.1f}mo ago)\n"
+        f"<b>Age:</b> <b>{age_days:.0f} days old</b> (Dormant ~{age_days/30:.1f} months)\n"
         f"<b>Market Cap:</b> ${mcap:,.0f}\n"
         f"<b>Liquidity:</b> ${liq:,.0f}\n"
-        f"<b>Volume:</b> 1h: ${vol_h1:,.0f} | 5m: ${vol_m5:,.0f}\n"
-        f"<b>1h Change:</b> {change_h1:+.1f}%\n"
+        f"<b>5m Change:</b> <b>{change_5m:+.1f}%</b> | <b>1h Change:</b> {change_h1:+.1f}%\n"
+        f"<b>Volume:</b> 5m: ${vol_m5:,.0f} | 1h: ${vol_h1:,.0f}\n"
         f"{buyers_text}\n"
         f"<b>Mint:</b> <code>{mint}</code>\n\n"
         f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> | "
@@ -350,8 +369,8 @@ def notify_radar_alert(pair_data, trigger="Radar", early_buyers=None):
     )
 
     plain = (
-        f"[{trigger}] ${sym} is waking up! Age: {age_days:.0f}d, Mcap: ${mcap:,.0f}, "
-        f"1h Vol: ${vol_h1:,.0f}, Pool: {pool}"
+        f"[{trigger}] ${sym} waking up! Age: {age_days:.0f}d, Mcap: ${mcap:,.0f}, "
+        f"5m: {change_5m:+.1f}%, 1h Vol: ${vol_h1:,.0f}, Pool: {pool}"
     )
     print("\n" + "="*60 + "\n*** RADAR ALERT *** " + plain + "\n" + "="*60)
     send_telegram(tg_text)
@@ -462,9 +481,13 @@ def check_candidate_pair(p, a, trigger):
 
     vol_h1 = float(p.get("volume", {}).get("h1") or 0)
     vol_m5 = float(p.get("volume", {}).get("m5") or 0)
+    change_5m = float(p.get("priceChange", {}).get("m5") or 0)
 
-    # In radar mode, require either a boost, recent 5m/1h volume, or transaction activity
-    if trigger == "Volume Spike" and vol_h1 < a.min_vol_h1 and vol_m5 < a.min_vol_m5:
+    # In radar mode, require either a boost, recent 5m price pop, or volume surge
+    if "5m" in trigger:
+        if change_5m < getattr(a, "min_change_5m", 10.0) and vol_m5 < getattr(a, "min_vol_m5", 100.0):
+            return None
+    elif trigger == "Volume Spike" and vol_h1 < a.min_vol_h1 and vol_m5 < a.min_vol_m5:
         return None
 
     p["_age_days"] = age_days
@@ -473,14 +496,14 @@ def check_candidate_pair(p, a, trigger):
 
 def cmd_radar(a):
     """
-    Real-time token radar. Streams DexScreener paid boosts, profile updates,
-    and DexPaprika spikes for tokens older than min_age (default 180 days).
+    Real-time token radar. Prioritizes 5-minute price surges and sudden early buys,
+    while watching DexScreener boosts for late-stage warnings.
     Requires ZERO Helius credits to discover tokens.
     """
     con = db()
     sol_usd = sol_price()
-    print(f"{datetime.now():%H:%M:%S} [RADAR] Starting token scanner:")
-    print(f"   Age >= {a.min_age} days | Mcap <= ${a.max_mcap:,.0f} | Max Liq <= ${a.max_liquidity:,.0f}")
+    print(f"{datetime.now():%H:%M:%S} [RADAR] Starting early wake-up token scanner:")
+    print(f"   Age >= {a.min_age}d | 5m Change >= +{a.min_change_5m}% | Mcap <= ${a.max_mcap:,.0f} | Max Liq <= ${a.max_liquidity:,.0f}")
     print(f"   Alerts will go to Telegram: {'Enabled' if TELEGRAM_TOKEN else 'Disabled (Set TELEGRAM_BOT_TOKEN)'}")
 
     # Load previously seen tokens from the last 12 hours
@@ -495,28 +518,58 @@ def cmd_radar(a):
 
     while True:
         try:
-            # 1. Check DexScreener Token Boosts (real-time revivals)
+            # 1. PRIORITY: Check for 5-minute price rips on dormant pools (MINUTE ZERO DETECTION)
+            if time.time() - last_paprika_scan >= a.interval:
+                last_paprika_scan = time.time()
+                try:
+                    cands = find_candidates(a)
+                    if cands:
+                        p_mints = [split_tokens(row)[0] for row in cands if split_tokens(row)[0]]
+                        p_mints = [m for m in p_mints if m not in seen_tokens]
+                        if p_mints:
+                            pairs = fetch_dexscreener_pairs(p_mints[:30])
+                            for p in pairs:
+                                matched = check_candidate_pair(p, a, "5m Price Spike")
+                                if matched:
+                                    mint = matched["baseToken"]["address"]
+                                    pool = matched["pairAddress"]
+                                    sym = matched["baseToken"].get("symbol", "")
+                                    seen_tokens.add(mint)
+                                    con.execute(
+                                        "INSERT OR REPLACE INTO radar_events VALUES(?,?,?,?,?,?,?)",
+                                        (mint, pool, sym, int(time.time()), matched["_age_days"], float(matched.get("fdv") or 0), "5m Price Spike"),
+                                    )
+                                    con.commit()
+
+                                    early_buyers = None
+                                    if HELIUS_KEY and not a.no_helius:
+                                        txs = helius_swaps(pool, int(time.time()) - 3600, max_pages=5)
+                                        early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
+
+                                    notify_radar_alert(matched, trigger="5m Price Spike", early_buyers=early_buyers)
+                except Exception as e:
+                    print(f"[Radar] 5m sweep error: {e}")
+
+            # 2. Check DexScreener Token Boosts & Profile Updates (Secondary Stream)
             boost_tokens = []
             try:
                 r = S.get("https://api.dexscreener.com/token-boosts/latest/v1", timeout=8).json()
                 boost_tokens = [x["tokenAddress"] for x in r if x.get("chainId") == "solana"]
             except Exception as e:
-                print(f"[Radar] Boost stream error: {e}")
+                pass
 
-            # 2. Check DexScreener Token Profile Updates (CTO / Logo revivals)
             profile_tokens = []
             try:
                 r = S.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8).json()
                 profile_tokens = [x["tokenAddress"] for x in r if x.get("chainId") == "solana"]
             except Exception as e:
-                print(f"[Radar] Profile stream error: {e}")
+                pass
 
             candidate_mints = [
                 m for m in set(boost_tokens + profile_tokens) if m not in seen_tokens and m not in BASE_MINTS
             ]
 
             if candidate_mints:
-                # Query DexScreener in chunks of 30
                 for i in range(0, len(candidate_mints), 30):
                     batch = candidate_mints[i : i + 30]
                     pairs = fetch_dexscreener_pairs(batch)
@@ -540,38 +593,6 @@ def cmd_radar(a):
                                 early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
 
                             notify_radar_alert(matched, trigger=trigger, early_buyers=early_buyers)
-
-            # 3. Every 60 seconds, check DexPaprika for old pools with sudden volume spikes (even without boosts)
-            if time.time() - last_paprika_scan > 60:
-                last_paprika_scan = time.time()
-                try:
-                    cands = find_candidates(a)
-                    if cands:
-                        p_mints = [split_tokens(row)[0] for row in cands if split_tokens(row)[0]]
-                        p_mints = [m for m in p_mints if m not in seen_tokens]
-                        if p_mints:
-                            pairs = fetch_dexscreener_pairs(p_mints[:30])
-                            for p in pairs:
-                                matched = check_candidate_pair(p, a, "Volume Spike")
-                                if matched:
-                                    mint = matched["baseToken"]["address"]
-                                    pool = matched["pairAddress"]
-                                    sym = matched["baseToken"].get("symbol", "")
-                                    seen_tokens.add(mint)
-                                    con.execute(
-                                        "INSERT OR REPLACE INTO radar_events VALUES(?,?,?,?,?,?,?)",
-                                        (mint, pool, sym, int(time.time()), matched["_age_days"], float(matched.get("fdv") or 0), "Volume Spike"),
-                                    )
-                                    con.commit()
-
-                                    early_buyers = None
-                                    if HELIUS_KEY and not a.no_helius:
-                                        txs = helius_swaps(pool, int(time.time()) - 3600, max_pages=5)
-                                        early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
-
-                                    notify_radar_alert(matched, trigger="Volume Spike", early_buyers=early_buyers)
-                except Exception as e:
-                    print(f"[Radar] Paprika volume sweep error: {e}")
 
         except Exception as e:
             print(f"[Radar] Unexpected loop error: {e}")
@@ -701,7 +722,7 @@ def main():
         sp.add_argument("--lookback", type=int, default=30, help="days used to judge dormancy (default: 30)")
         sp.add_argument("--hours", type=int, default=72, help="recent window used to look for the pump")
         sp.add_argument("--max-active-frac", type=float, default=0.15, help="dormant if <= this share of prior days had trades")
-        sp.add_argument("--spike-mult", type=float, default=5, help="peak must exceed baseline price by this multiple")
+        sp.add_argument("--spike-mult", type=float, default=1.35, help="peak must exceed baseline price by this multiple (default: 1.35x)")
         sp.add_argument("--dumped-below", type=float, default=0.5, help="DUMPED if price <= this share of peak")
         sp.add_argument("--min-wallet-usd", type=float, default=500.0, help="minimum USD buy to profile wallet (default: 500)")
         sp.add_argument("--early-mins", type=int, default=30, help="wallets buying within this of the first big buy are EARLY")
@@ -709,17 +730,18 @@ def main():
         sp.add_argument("--top", type=int, default=15)
         sp.add_argument("--no-wallets", action="store_true")
 
-    # 1. RADAR: DexScreener token-first real-time stream (RECOMMENDED)
-    r = sub.add_parser("radar", help="Real-time DexScreener stream for old tokens waking up (zero Helius credits)")
-    r.add_argument("--min-age", type=int, default=180, help="minimum pool age in days (default: 180 = 6 months)")
+    # 1. RADAR: DexScreener & DexPaprika early wake-up stream (RECOMMENDED)
+    r = sub.add_parser("radar", help="Real-time 5m wake-up stream for dormant tokens (zero Helius credits)")
+    r.add_argument("--min-age", type=int, default=60, help="minimum pool age in days (default: 60 = 2 months)")
     r.add_argument("--max-mcap", type=float, default=75000, help="maximum market cap USD (default: 75,000)")
     r.add_argument("--max-liquidity", type=float, default=25000, help="maximum liquidity USD (default: 25,000)")
-    r.add_argument("--min-vol-h1", type=float, default=1000, help="min 1h volume for volume trigger (default: 1,000)")
-    r.add_argument("--min-vol-m5", type=float, default=300, help="min 5m volume for volume trigger (default: 300)")
+    r.add_argument("--min-change-5m", type=float, default=10.0, help="min 5m price change percent (default: 10.0)")
+    r.add_argument("--min-change", type=float, default=25.0, help="1h price change percent for sweep (default: 25.0)")
+    r.add_argument("--min-vol-h1", type=float, default=250, help="min 1h volume (default: 250)")
+    r.add_argument("--min-vol-m5", type=float, default=100, help="min 5m volume (default: 100)")
     r.add_argument("--min-wallet-usd", type=float, default=500.0, help="minimum USD buy to profile early buyers")
-    r.add_argument("--min-change", type=float, default=50, help="1h price change percent for background sweep")
-    r.add_argument("--min-txns", type=int, default=15)
-    r.add_argument("--min-vol", type=float, default=1500)
+    r.add_argument("--min-txns", type=int, default=1, help="minimum transactions (default: 1)")
+    r.add_argument("--min-vol", type=float, default=100, help="minimum 24h volume (default: 100)")
     r.add_argument("--pages", type=int, default=2)
     r.add_argument("--interval", type=int, default=12, help="polling interval in seconds (default: 12)")
     r.add_argument("--no-helius", action="store_true", help="skip Helius buyer profiling to preserve completely free operation")
@@ -728,9 +750,10 @@ def main():
     # 2. SCAN: DexPaprika candidate screener
     s = sub.add_parser("scan"); common(s)
     s.add_argument("--min-age", type=int, default=30, help="pool age in days (default: 30)")
-    s.add_argument("--min-change", type=float, default=100, help="1h/6h price change percent to consider")
-    s.add_argument("--min-txns", type=int, default=20)
-    s.add_argument("--min-vol", type=float, default=2000)
+    s.add_argument("--min-change-5m", type=float, default=10.0, help="min 5m price change percent (default: 10.0)")
+    s.add_argument("--min-change", type=float, default=25.0, help="min 1h price change percent (default: 25.0)")
+    s.add_argument("--min-txns", type=int, default=1, help="minimum 24h transactions (default: 1)")
+    s.add_argument("--min-vol", type=float, default=100, help="minimum 24h volume USD (default: 100)")
     s.add_argument("--pages", type=int, default=3)
     s.add_argument("--loop", type=int, default=0, help="repeat every N seconds")
     s.set_defaults(f=cmd_scan)
