@@ -40,6 +40,22 @@ Polls Helius for transactions from wallets on your leaderboard.
 python dormant_pump_scanner.py watch --interval 45
 ```
 
+### 6. `outcomes` [Historical Pattern Analyzer]
+Tracks what happens to every coin found by the scanner over the next 4 hours:
+- Automatically tracks checkpoints at **5m, 15m, 30m, 1h, 2h, 4h**.
+- Records peak multiple, peak market cap, and time to peak.
+- Classifies tokens as **Big Runners ($\ge$ 3x)**, **Modest Runs (1.5x - 3x)**, or **Immediate Dumps (< 1.5x)**.
+- Compares entry liquidity, 5m volume, social presence, and buyer counts between runners and dumpers.
+- Exports complete dataset to CSV for Excel / Pandas analysis.
+
+```bash
+# View summary table and comparative patterns
+python dormant_pump_scanner.py outcomes
+
+# Export all tracked data to CSV for Excel/Pandas
+python dormant_pump_scanner.py outcomes --csv outcomes.csv
+```
+
 ---
 
 ## Deploying to a DigitalOcean Droplet

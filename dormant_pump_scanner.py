@@ -412,7 +412,15 @@ def db():
     CREATE TABLE IF NOT EXISTS wallet_events(wallet TEXT, pool TEXT, token TEXT, first INT, buy REAL,
         sell REAL, pnl REAL, exit_frac REAL, early INT, PRIMARY KEY(wallet, pool));
     CREATE TABLE IF NOT EXISTS radar_events(token TEXT PRIMARY KEY, pool TEXT, symbol TEXT, seen INT,
-        age_days REAL, mcap REAL, trigger TEXT);"""
+        age_days REAL, mcap REAL, trigger TEXT);
+    CREATE TABLE IF NOT EXISTS token_outcomes(
+        token TEXT PRIMARY KEY, symbol TEXT, pool TEXT, alerted_at INT, age_days REAL,
+        entry_price REAL, entry_mcap REAL, entry_liquidity REAL, entry_vol_5m REAL,
+        entry_vol_1h REAL, entry_txns_5m INT, entry_change_5m REAL, trigger TEXT,
+        has_socials INT, has_boost INT, early_buyers_count INT, early_buyers_usd REAL,
+        mult_5m REAL, mult_15m REAL, mult_30m REAL, mult_1h REAL, mult_2h REAL, mult_4h REAL,
+        peak_mult REAL, peak_mcap REAL, peak_time_mins REAL, current_mult REAL,
+        outcome_class TEXT, last_updated INT, is_finished INT);"""
     )
     return c
 
@@ -442,6 +450,136 @@ def process_pool(con, pool, mint, sym, ev, a, sol_usd):
             "INSERT OR REPLACE INTO wallet_events VALUES(?,?,?,?,?,?,?,?,?)",
             (r["wallet"], pool, mint, r["first"], r["buy"], r["sell"], r["pnl"], r["exit_frac"], r["early"]),
         )
+    con.commit()
+
+
+# ----------------------------------------------------------------- outcome tracker
+def record_initial_outcome(con, p, trigger, early_buyers=None):
+    mint = p.get("baseToken", {}).get("address")
+    if not mint:
+        return
+    sym = p.get("baseToken", {}).get("symbol", "")
+    pool = p.get("pairAddress", "")
+    now = int(time.time())
+    entry_price = float(p.get("priceUsd") or 0.0)
+    entry_mcap = float(p.get("fdv") or p.get("marketCap") or 0.0)
+    entry_liq = float(p.get("liquidity", {}).get("usd") or 0.0)
+    vol_5m = float(p.get("volume", {}).get("m5") or 0.0)
+    vol_1h = float(p.get("volume", {}).get("h1") or 0.0)
+    txns_5m = int(p.get("txns", {}).get("m5", {}).get("buys", 0) + p.get("txns", {}).get("m5", {}).get("sells", 0))
+    change_5m = float(p.get("priceChange", {}).get("m5") or 0.0)
+    age_days = float(p.get("_age_days") or 0.0)
+    has_socials = int(bool(p.get("info", {}).get("socials") or p.get("info", {}).get("websites")))
+    has_boost = int("Boost" in trigger or (p.get("boosts", {}).get("active", 0) > 0))
+
+    buyers_count = len(early_buyers) if early_buyers else 0
+    buyers_usd = sum(b.get("buy", 0.0) for b in early_buyers) if early_buyers else 0.0
+
+    con.execute("""
+        INSERT OR IGNORE INTO token_outcomes (
+            token, symbol, pool, alerted_at, age_days, entry_price, entry_mcap,
+            entry_liquidity, entry_vol_5m, entry_vol_1h, entry_txns_5m, entry_change_5m,
+            trigger, has_socials, has_boost, early_buyers_count, early_buyers_usd,
+            peak_mult, peak_mcap, peak_time_mins, current_mult, outcome_class,
+            last_updated, is_finished
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        mint, sym, pool, now, age_days, entry_price, entry_mcap,
+        entry_liq, vol_5m, vol_1h, txns_5m, change_5m,
+        trigger, has_socials, has_boost, buyers_count, buyers_usd,
+        1.0, entry_mcap, 0.0, 1.0, "ACTIVE",
+        now, 0
+    ))
+    con.commit()
+
+
+def update_tracked_outcomes(con):
+    """
+    Checks on-chain prices for all alerted tokens across the last 4 hours.
+    Records checkpoints at 5m, 15m, 30m, 1h, 2h, 4h and registers peak multipliers.
+    """
+    now = int(time.time())
+    rows = con.execute("""
+        SELECT token, pool, alerted_at, entry_price, entry_mcap, peak_mult, peak_mcap, peak_time_mins,
+               mult_5m, mult_15m, mult_30m, mult_1h, mult_2h, mult_4h
+        FROM token_outcomes
+        WHERE is_finished = 0
+    """).fetchall()
+
+    if not rows:
+        return
+
+    mints = [r[0] for r in rows]
+    token_map = {r[0]: r for r in rows}
+
+    for i in range(0, len(mints), 30):
+        batch = mints[i : i + 30]
+        pairs = fetch_dexscreener_pairs(batch)
+        for p in pairs:
+            mint = p.get("baseToken", {}).get("address")
+            if mint not in token_map:
+                continue
+            r = token_map[mint]
+            alerted_at, entry_price, entry_mcap = r[2], r[3], r[4]
+            peak_mult, peak_mcap, peak_time_mins = r[5], r[6], r[7]
+            mult_5m, mult_15m, mult_30m, mult_1h, mult_2h, mult_4h = r[8], r[9], r[10], r[11], r[12], r[13]
+
+            cur_price = float(p.get("priceUsd") or 0.0)
+            cur_mcap = float(p.get("fdv") or p.get("marketCap") or 0.0)
+            cur_liq = float(p.get("liquidity", {}).get("usd") or 0.0)
+            elapsed_mins = (now - alerted_at) / 60.0
+
+            cur_mult = cur_price / entry_price if entry_price > 0 else 1.0
+
+            # Update peak multiple & peak market cap
+            if cur_mult > (peak_mult or 1.0):
+                peak_mult = cur_mult
+                peak_mcap = cur_mcap
+                peak_time_mins = round(elapsed_mins, 1)
+
+            # Checkpoints
+            if mult_5m is None and elapsed_mins >= 5:
+                mult_5m = cur_mult
+            if mult_15m is None and elapsed_mins >= 15:
+                mult_15m = cur_mult
+            if mult_30m is None and elapsed_mins >= 30:
+                mult_30m = cur_mult
+            if mult_1h is None and elapsed_mins >= 60:
+                mult_1h = cur_mult
+            if mult_2h is None and elapsed_mins >= 120:
+                mult_2h = cur_mult
+            if mult_4h is None and elapsed_mins >= 240:
+                mult_4h = cur_mult
+
+            # Outcome classification
+            is_finished = 0
+            if elapsed_mins >= 240 or (cur_liq < 300 and elapsed_mins >= 10):
+                is_finished = 1
+                if peak_mult >= 3.0:
+                    outcome_class = "BIG_RUNNER"
+                elif peak_mult >= 1.5:
+                    outcome_class = "MODEST_RUN"
+                else:
+                    outcome_class = "DUMP_IMMEDIATE"
+            else:
+                if peak_mult >= 3.0:
+                    outcome_class = "BIG_RUNNER"
+                elif elapsed_mins >= 25 and peak_mult < 1.35 and cur_mult < 0.75:
+                    outcome_class = "DUMP_IMMEDIATE"
+                else:
+                    outcome_class = "ACTIVE"
+
+            con.execute("""
+                UPDATE token_outcomes SET
+                    mult_5m=?, mult_15m=?, mult_30m=?, mult_1h=?, mult_2h=?, mult_4h=?,
+                    peak_mult=?, peak_mcap=?, peak_time_mins=?, current_mult=?,
+                    outcome_class=?, last_updated=?, is_finished=?
+                WHERE token=?
+            """, (
+                mult_5m, mult_15m, mult_30m, mult_1h, mult_2h, mult_4h,
+                peak_mult, peak_mcap, peak_time_mins, cur_mult,
+                outcome_class, now, is_finished, mint
+            ))
     con.commit()
 
 
@@ -515,6 +653,7 @@ def cmd_radar(a):
     )
 
     last_paprika_scan = 0
+    last_outcome_check = 0
 
     while True:
         try:
@@ -547,6 +686,7 @@ def cmd_radar(a):
                                         early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
 
                                     notify_radar_alert(matched, trigger="5m Price Spike", early_buyers=early_buyers)
+                                    record_initial_outcome(con, matched, "5m Price Spike", early_buyers=early_buyers)
                 except Exception as e:
                     print(f"[Radar] 5m sweep error: {e}")
 
@@ -593,6 +733,15 @@ def cmd_radar(a):
                                 early_buyers = aggregate_wallets(txs, mint, sol_usd, a.min_wallet_usd, early_mins=30)
 
                             notify_radar_alert(matched, trigger=trigger, early_buyers=early_buyers)
+                            record_initial_outcome(con, matched, trigger=trigger, early_buyers=early_buyers)
+
+            # 3. Track performance & price checkpoints of all active alerted coins (every 30s)
+            if time.time() - last_outcome_check >= 30:
+                last_outcome_check = time.time()
+                try:
+                    update_tracked_outcomes(con)
+                except Exception as e:
+                    print(f"[Outcomes] Update error: {e}")
 
         except Exception as e:
             print(f"[Radar] Unexpected loop error: {e}")
@@ -714,6 +863,105 @@ def check_token(mint, a):
         return None
 
 
+def cmd_outcomes(a):
+    con = db()
+    query = """
+        SELECT token, symbol, alerted_at, age_days, entry_mcap, entry_liquidity,
+               entry_vol_5m, entry_txns_5m, trigger, has_socials, has_boost,
+               early_buyers_count, early_buyers_usd, mult_5m, mult_15m, mult_30m,
+               mult_1h, peak_mult, peak_mcap, peak_time_mins, outcome_class, is_finished
+        FROM token_outcomes
+    """
+    params = []
+    if getattr(a, "min_mult", None):
+        query += " WHERE peak_mult >= ?"
+        params.append(a.min_mult)
+    query += " ORDER BY alerted_at DESC LIMIT ?"
+    params.append(getattr(a, "limit", 50))
+
+    rows = con.execute(query, params).fetchall()
+    if not rows:
+        print("No tracked token outcomes found yet. Run `radar` or `scan` to start tracking tokens.")
+        return
+
+    print("=" * 110)
+    print(f"{'TIME':12} {'SYMBOL':10} {'AGE':>6} {'ENTRY MCAP':>11} {'LIQ':>8} {'5m VOL':>8} {'TRIGGER':16} {'PEAK':>7} {'TIME':>6} {'OUTCOME':14}")
+    print("-" * 110)
+
+    for r in rows:
+        t_str = datetime.fromtimestamp(r[2], timezone.utc).strftime("%m-%d %H:%M")
+        sym = (r[1] or "UNKNOWN")[:9]
+        age = f"{r[3]:.0f}d"
+        mcap = f"${r[4]:,.0f}" if r[4] else "-"
+        liq = f"${r[5]:,.0f}" if r[5] else "-"
+        vol5 = f"${r[6]:,.0f}" if r[6] else "-"
+        trig = (r[8] or "")[:15]
+        peak = f"{r[17]:.1f}x" if r[17] else "-"
+        pk_time = f"{r[19]:.0f}m" if r[19] else "-"
+        outcome = r[20] or "ACTIVE"
+
+        print(f"{t_str:12} {sym:10} {age:>6} {mcap:>11} {liq:>8} {vol5:>8} {trig:16} {peak:>7} {pk_time:>6} {outcome:14}")
+
+    print("=" * 110)
+
+    # Statistical Breakdown of Runners vs Dumpers
+    all_tokens = con.execute("""
+        SELECT outcome_class, peak_mult, peak_time_mins, entry_liquidity, entry_vol_5m,
+               entry_mcap, has_socials, has_boost, early_buyers_count, early_buyers_usd
+        FROM token_outcomes
+    """).fetchall()
+
+    runners = [x for x in all_tokens if (x[1] or 0) >= 3.0]
+    modest = [x for x in all_tokens if 1.5 <= (x[1] or 0) < 3.0]
+    dumpers = [x for x in all_tokens if (x[1] or 0) < 1.5 and x[0] != "ACTIVE"]
+
+    n_tot = len(all_tokens)
+    print("\n" + "=" * 70)
+    print(f"OUTCOME PATTERN ANALYSIS ({n_tot} Total Tokens Tracked)")
+    print("=" * 70)
+    print(f"* Big Runners (>= 3.0x):     {len(runners):>3} ({len(runners)/max(n_tot,1):>5.1%}) | Avg Peak: {statistics.mean([x[1] for x in runners]):.1f}x" if runners else "* Big Runners (>= 3.0x):       0")
+    print(f"* Modest Runs (1.5x - 3.0x): {len(modest):>3} ({len(modest)/max(n_tot,1):>5.1%}) | Avg Peak: {statistics.mean([x[1] for x in modest]):.1f}x" if modest else "* Modest Runs (1.5x - 3.0x):   0")
+    print(f"* Immediate Dumps (< 1.5x):  {len(dumpers):>3} ({len(dumpers)/max(n_tot,1):>5.1%}) | Avg Peak: {statistics.mean([x[1] for x in dumpers]):.1f}x" if dumpers else "* Immediate Dumps (< 1.5x):    0")
+
+    if runners and dumpers:
+        avg_liq_run = statistics.mean([x[3] for x in runners if x[3]]) if any(x[3] for x in runners) else 0
+        avg_liq_dmp = statistics.mean([x[3] for x in dumpers if x[3]]) if any(x[3] for x in dumpers) else 0
+
+        avg_vol_run = statistics.mean([x[4] for x in runners if x[4]]) if any(x[4] for x in runners) else 0
+        avg_vol_dmp = statistics.mean([x[4] for x in dumpers if x[4]]) if any(x[4] for x in dumpers) else 0
+
+        soc_run = statistics.mean([x[6] for x in runners]) * 100
+        soc_dmp = statistics.mean([x[6] for x in dumpers]) * 100
+
+        pk_time_run = statistics.mean([x[2] for x in runners if x[2]]) if any(x[2] for x in runners) else 0
+
+        print("\nKEY COMPARATIVE METRICS:")
+        print(f"{'Metric':<25} {'Runners (>=3x)':<20} {'Immediate Dumpers (<1.5x)':<25}")
+        print("-" * 70)
+        print(f"{'Avg Entry Liquidity':<25} ${avg_liq_run:>10,.0f}         ${avg_liq_dmp:>10,.0f}")
+        print(f"{'Avg 5m Volume':<25} ${avg_vol_run:>10,.0f}         ${avg_vol_dmp:>10,.0f}")
+        print(f"{'Social Presence %':<25} {soc_run:>10.1f}%         {soc_dmp:>10.1f}%")
+        print(f"{'Avg Time to Peak':<25} {pk_time_run:>10.1f} mins       Immediate / <5 mins")
+        print("=" * 70)
+
+    # Export to CSV if requested
+    csv_file = getattr(a, "csv", None)
+    if csv_file:
+        import csv
+        headers = [
+            "token", "symbol", "alerted_at", "age_days", "entry_mcap", "entry_liquidity",
+            "entry_vol_5m", "entry_txns_5m", "trigger", "has_socials", "has_boost",
+            "early_buyers_count", "early_buyers_usd", "mult_5m", "mult_15m", "mult_30m",
+            "mult_1h", "peak_mult", "peak_mcap", "peak_time_mins", "outcome_class", "is_finished"
+        ]
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow(r)
+        print(f"\n[Export] Saved {len(rows)} rows to {csv_file}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -770,6 +1018,13 @@ def main():
     s.add_argument("--wallets", help="file with extra wallet addresses, one per line")
     s.add_argument("--interval", type=int, default=20)
     s.set_defaults(f=cmd_watch)
+
+    # 6. OUTCOMES: Historical pattern analyzer and performance tracker
+    s = sub.add_parser("outcomes", help="Analyze what happened to coins found by the scanner (runners vs dumpers)")
+    s.add_argument("--limit", type=int, default=50, help="maximum tokens to display (default: 50)")
+    s.add_argument("--min-mult", type=float, help="filter by minimum peak multiple (e.g. 2.0)")
+    s.add_argument("--csv", help="export complete outcome dataset to CSV file (e.g. outcomes.csv)")
+    s.set_defaults(f=cmd_outcomes)
 
     a = p.parse_args()
     if a.cmd in ("watch",) and not HELIUS_KEY:
