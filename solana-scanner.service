@@ -1,0 +1,15 @@
+[Unit]
+Description=Solana Dormant Token Scanner & Wallet Watcher
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/solana-dormant-pump-scanner
+EnvironmentFile=/root/solana-dormant-pump-scanner/.env
+ExecStart=/usr/bin/python3 -u dormant_pump_scanner.py watch --interval 20
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

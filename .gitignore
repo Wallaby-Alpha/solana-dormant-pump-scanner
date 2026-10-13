@@ -1,0 +1,8 @@
+.env
+scanner.db
+*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+wallets_custom.txt
